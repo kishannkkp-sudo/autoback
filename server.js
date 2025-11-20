@@ -1,11 +1,46 @@
-// server.js - FirstJobly Backend v6 (FINAL & BULLETPROOF)
+// server.js - FirstJobly Backend v8 (CLEAN & SECURE - NO HARDCODED DB CREDENTIALS)
 const express = require('express');
 const mysql = require('mysql2/promise');
 const bodyParser = require('body-parser');
 const cors = require('cors');
+const admin = require('firebase-admin');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+// ====================== FIREBASE ADMIN SDK INITIALIZATION ======================
+let firebaseApp = null;
+
+try {
+  let serviceAccount = null;
+
+  // 1. Production: Use environment variable (Render, Railway, Vercel, etc.)
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    console.log('Firebase: Loaded from FIREBASE_SERVICE_ACCOUNT env var');
+  }
+  // 2. Local dev: Use serviceAccountKey.json file
+  else if (fs.existsSync(path.join(__dirname, 'serviceAccountKey.json'))) {
+    serviceAccount = require('./serviceAccountKey.json');
+    console.log('Firebase: Loaded from ./serviceAccountKey.json');
+  }
+  // 3. Fallback (only for quick testing - will warn)
+  else {
+    console.warn('Firebase key not found. Set FIREBASE_SERVICE_ACCOUNT or add serviceAccountKey.json');
+  }
+
+  if (serviceAccount) {
+    firebaseApp = admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      databaseURL: "https://nodejs-d2e2f-default-rtdb.asia-southeast1.firebasedatabase.app"
+    });
+    console.log('Firebase Admin SDK initialized successfully!');
+  }
+} catch (error) {
+  console.error('Firebase init failed:', error.message);
+}
 
 // Middleware
 app.use(bodyParser.json({ limit: '10mb' }));
@@ -15,14 +50,15 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-// TiDB Cloud Config
+// ==================== DATABASE CONFIG - 100% ENVIRONMENT VARIABLES ONLY ====================
+// NO MORE HARDCODED CREDENTIALS!
 const dbConfig = {
-  host: process.env.DB_HOST || 'gateway01.ap-southeast-1.prod.aws.tidbcloud.com',
-  port: process.env.DB_PORT || 4000,
-  user: process.env.DB_USER || '2hHpQFMDsuaTdbF.root',
-  password: process.env.DB_PASSWORD || 'Rb9LMJstTQffMdRu',
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT ? parseInt(process.env.DB_PORT) : 4000,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME || 'test',
-  ssl: { rejectUnauthorized: true },
+  ssl: process.env.DB_HOST ? { rejectUnauthorized: true } : undefined,
   connectTimeout: 20000,
   connectionLimit: 15,
   waitForConnections: true,
@@ -30,51 +66,63 @@ const dbConfig = {
 };
 
 let pool = null;
-let isMySQL = false;  // Critical flag to detect which DB is active
+let isMySQL = false;
 
-// Connect to TiDB Cloud → Fallback to SQLite only if fails
+// Connect to Database (TiDB Cloud via env vars → fallback to SQLite)
 async function connectToDatabase() {
+  const requiredEnv = ['DB_HOST', 'DB_USER', 'DB_PASSWORD'];
+  const missing = requiredEnv.filter(key => !process.env[key]);
+
+  if (missing.length > 0 && !process.env.DB_HOST) {
+    console.warn('No TiDB credentials found → switching to local SQLite fallback');
+    useSQLiteFallback();
+    return;
+  }
+
   try {
     pool = mysql.createPool(dbConfig);
     const connection = await pool.getConnection();
-    console.log('SUCCESS: Connected to TiDB Cloud MySQL');
+    console.log('SUCCESS: Connected to TiDB Cloud (via environment variables)');
     isMySQL = true;
     connection.release();
   } catch (err) {
-    console.warn('TiDB Cloud connection failed → switching to local SQLite fallback');
-    console.warn('Make sure your IP is whitelisted in TiDB Cloud Dashboard!');
-    
-    const sqlite3 = require('sqlite3').verbose();
-    pool = new sqlite3.Database('./jobs_local.db');
-    isMySQL = false;
-
-    pool.serialize(() => {
-      pool.run(`
-        CREATE TABLE IF NOT EXISTS posts (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          title TEXT NOT NULL,
-          description TEXT NOT NULL,
-          company_name TEXT,
-          company_logo TEXT,
-          job_req_id TEXT UNIQUE,
-          apply_link TEXT,
-          location TEXT,
-          experience TEXT,
-          skills TEXT,
-          remote_type TEXT,
-          time_type TEXT,
-          posted_date TEXT,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
-      pool.run('CREATE INDEX IF NOT EXISTS idx_created_at ON posts(created_at DESC)');
-      pool.run('CREATE INDEX IF NOT EXISTS idx_job_req ON posts(job_req_id)');
-    });
-    console.log('SQLite fallback database ready at ./jobs_local.db');
+    console.error('TiDB connection failed:', err.message);
+    console.warn('Falling back to local SQLite database...');
+    useSQLiteFallback();
   }
 }
 
-// Initialize MySQL table with proper indexes
+function useSQLiteFallback() {
+  const sqlite3 = require('sqlite3').verbose();
+  pool = new sqlite3.Database('./jobs_local.db');
+  isMySQL = false;
+
+  pool.serialize(() => {
+    pool.run(`
+      CREATE TABLE IF NOT EXISTS posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        company_name TEXT,
+        company_logo TEXT,
+        job_req_id TEXT UNIQUE,
+        apply_link TEXT,
+        location TEXT,
+        experience TEXT,
+        skills TEXT,
+        remote_type TEXT,
+        time_type TEXT,
+        posted_date TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    pool.run('CREATE INDEX IF NOT EXISTS idx_created_at ON posts(created_at DESC)');
+    pool.run('CREATE INDEX IF NOT EXISTS idx_job_req ON posts(job_req_id)');
+  });
+  console.log('SQLite fallback database ready → ./jobs_local.db');
+}
+
+// Initialize MySQL table (only if using TiDB)
 async function initializeMySQLTable() {
   if (!isMySQL) return;
   try {
@@ -101,13 +149,13 @@ async function initializeMySQLTable() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
     conn.release();
-    console.log('MySQL table initialized with fast indexes');
+    console.log('MySQL table initialized with optimal indexes');
   } catch (err) {
     console.error('Failed to create MySQL table:', err.message);
   }
 }
 
-// POST - Save new job (prevents duplicates)
+// POST - Save new job (duplicate-safe)
 app.post('/posts', async (req, res) => {
   const {
     title, description, company_name, company_logo, job_req_id,
@@ -155,7 +203,7 @@ app.post('/posts', async (req, res) => {
   }
 });
 
-// GET - Paginated Jobs (24 per page) — WORKS FOR BOTH MySQL & SQLite
+// GET - Paginated Jobs (24 per page)
 app.get('/posts', async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const limit = 24;
@@ -185,12 +233,12 @@ app.get('/posts', async (req, res) => {
       });
       total = await new Promise((resolve, reject) => {
         pool.get('SELECT COUNT(*) as total FROM posts', (err, row) => {
-          err ? reject(err) : resolve(row.total);
+          err ? reject(err) : resolve(row?.total || 0);
         });
       });
     }
 
-    // Parse skills
+    // Parse skills JSON
     jobs.forEach(job => {
       if (job.skills) {
         try {
@@ -253,31 +301,28 @@ app.get('/posts/:id', async (req, res) => {
 // Health Check
 app.get('/', (req, res) => {
   res.json({
-    status: "FirstJobly Backend v6 – 100% WORKING",
-    database: isMySQL ? "TiDB Cloud MySQL (Production)" : "Local SQLite (Fallback)",
+    status: "FirstJobly Backend v8 – CLEAN & SECURE",
+    database: isMySQL ? "TiDB Cloud (via env vars)" : "Local SQLite Fallback",
+    firebase: firebaseApp ? "Active" : "Not initialized",
     time: new Date().toISOString(),
     jobs_per_page: 24,
-    endpoints: {
-      "GET /posts?page=1": "24 latest jobs",
-      "GET /posts/123": "Single job",
-      "POST /posts": "Add new job"
-    },
-    tip: "Your site is now blazing fast with pagination!"
+    security: "No hardcoded credentials",
+    tip: "Set DB_HOST, DB_USER, DB_PASSWORD + FIREBASE_SERVICE_ACCOUNT in your hosting dashboard!"
   });
 });
 
 // Start Server
 (async () => {
   await connectToDatabase();
-  if (isMySQL) {
-    await initializeMySQLTable();
-  }
+  if (isMySQL) await initializeMySQLTable();
 
   app.listen(port, () => {
     console.log('=====================================');
-    console.log(`SERVER RUNNING → http://localhost:${port}`);
-    console.log(`Database: ${isMySQL ? 'TiDB Cloud MySQL' : 'Local SQLite Fallback'}`);
-    console.log(`24 Jobs per page | Lightning Fast`);
+    console.log(`FIRSTJOBLY BACKEND v8 IS RUNNING`);
+    console.log(`http://localhost:${port}`);
+    console.log(`Database → ${isMySQL ? 'TiDB Cloud (Secure)' : 'SQLite (Local)'}`);
+    console.log(`Firebase → ${firebaseApp ? 'Connected' : 'Not Connected'}`);
+    console.log(`NO HARDCODED PASSWORDS ANYWHERE`);
     console.log('=====================================');
   });
 })();
